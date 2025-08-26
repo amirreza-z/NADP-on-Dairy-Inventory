@@ -642,12 +642,15 @@ class NADPAgent:
         raw_rewards = []
         episode_successes = []
         per_episode_cache = []  # store per-episode lists to split later
+        waste_rates = []
 
         for _ in range(n_episodes):
             start_day = self._curriculum_start_day()
             s = self.env.reset(start_day)
             epS, epO, epLP, epR, epV, epRaw = [], [], [], [], [], []
             done = False
+            ep_expired = 0.0
+            ep_fulfilled = 0.0
             while not done:
                 a, lp, v, output = self._step_policy(s, self.env, deterministic=False, 
                                                    update_stats=not self.cfg.precompute_norm)
@@ -656,6 +659,8 @@ class NADPAgent:
                 epO.append(output)
                 epLP.append(lp); epR.append(r); epV.append(v)
                 epRaw.append(info.get('raw_reward', r * self.env.cfg.reward_scale))
+                ep_expired += float(np.sum(info.get('expired', 0.0)))
+                ep_fulfilled += float(np.sum(info.get('fulfilled', 0.0)))
                 s = ns
 
             ep_len = len(epR)
@@ -671,6 +676,9 @@ class NADPAgent:
                 "raw_rewards": np.array(epRaw, np.float32),
                 "length": ep_len
             })
+            # NEW: per-episode waste rate
+            wr = ep_expired / (ep_expired + ep_fulfilled + 1e-6)
+            waste_rates.append(wr)
 
             # simple success heuristic: raw episode reward > 0
             episode_successes.append(float(np.sum(epRaw) > 0.0))
@@ -691,6 +699,7 @@ class NADPAgent:
             "values": np.array(V, np.float32),
             "lengths": np.array(L, np.int32),
             "raw_rewards": np.array(raw_rewards, np.float32),
+            "waste_rates": np.array(waste_rates, np.float32),
         }
 
         # GAE
@@ -878,6 +887,7 @@ class NADPAgent:
         reward_log = []
         raw_reward_log = []
         success_rate_log = []
+        waste_rate_log = []
         best_performance = float('-inf')
         
         for u in range(self.cfg.train_updates):
@@ -888,6 +898,7 @@ class NADPAgent:
             reward_log.append(avg_r)
             raw_reward_log.append(avg_raw_r)
             success_rate_log.append(self.success_rate)
+            waste_rate_log.append(float(np.mean(traj["waste_rates"])))
             metrics = self.nadp_update(traj, beta, u)
 
             if avg_raw_r > best_performance:
@@ -902,7 +913,7 @@ class NADPAgent:
                       f"entropy={metrics.get('entropy',0):.4f} β={beta:.4f}")
         
         self._save_checkpoint("nadp_actor_multi.pth")
-        self._plot_training_curves(reward_log, raw_reward_log, success_rate_log, "enhanced_nadp_training.png")
+        self._plot_training_curves(reward_log, raw_reward_log, waste_rate_log, "enhanced_nadp_training.png")
         print("Training completed! Saved models and training curves.")
 
     def _save_checkpoint(self, path: str):
@@ -920,7 +931,7 @@ class NADPAgent:
 
     @staticmethod
     def _plot_training_curves(scaled_rewards: List[float], raw_rewards: List[float], 
-                              success_rates: List[float], path: str):
+                              waste_rates: List[float], path: str):
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         ax1.plot(scaled_rewards, label="Scaled reward", alpha=0.7)
         ax1.set_xlabel("Update"); ax1.set_ylabel("Average scaled reward")
@@ -933,10 +944,10 @@ class NADPAgent:
             ax2.plot(updates, p(updates), "--", alpha=0.8, label="Trend")
         ax2.set_xlabel("Update"); ax2.set_ylabel("Average raw reward")
         ax2.set_title("NADP Training - Raw Performance"); ax2.legend(); ax2.grid(True, alpha=0.3)
-        ax3.plot(success_rates, label="Success rate", alpha=0.7)
-        ax3.axhline(y=0.7, linestyle='--', label='Target (70%)')
-        ax3.set_xlabel("Update"); ax3.set_ylabel("Success rate")
-        ax3.set_title("Training Success Rate"); ax3.legend(); ax3.grid(True, alpha=0.3)
+        ax3.plot(waste_rates, label="Waste rate", alpha=0.7)
+        ax3.axhline(y=0.10, linestyle='--', label='Target (10%)')
+        ax3.set_xlabel("Update"); ax3.set_ylabel("Waste rate")
+        ax3.set_title("Average Waste Rate per Update"); ax3.legend(); ax3.grid(True, alpha=0.3)
         if len(raw_rewards) > 50:
             recent_rewards = raw_rewards[-50:]
             ax4.hist(recent_rewards, bins=20, alpha=0.7)
