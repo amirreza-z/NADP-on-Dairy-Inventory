@@ -983,10 +983,48 @@ def policy_base_stock(env: PerishableInventoryEnv, k_days: int = 5, safety_mult:
 # ----------------------------
 # Enhanced evaluation functions
 # ----------------------------
-def evaluate_nadp(env: PerishableInventoryEnv, actor_path: str, episodes: int = 50,
-                          deterministic: bool = True, seed: int = 123, start_days: Optional[List[int]] = None) -> Dict[str, float]:
-    """Evaluate NADP actor."""
+def evaluate_nadp(
+    env: PerishableInventoryEnv,
+    actor_path: str,
+    episodes: int = 50,
+    deterministic: bool = True,
+    seed: int = 123,
+    start_days: Optional[List[int]] = None,
+    make_plots: bool = True,
+    save_prefix: str = "eval"
+) -> Dict[str, float]:
+    """
+    Evaluate NADP actor and (optionally) produce publication-quality plots.
+
+    Saves (if make_plots=True):
+      - {save_prefix}_returns_line.(pdf|svg|png)
+      - {save_prefix}_returns_hist_ecdf.(pdf|svg|png)
+      - {save_prefix}_returns_vs_waste.(pdf|svg|png)
+      - {save_prefix}_violin_box.(pdf|svg|png)
+      - {save_prefix}_multipanel.(pdf|svg|png)
+    """
     set_all_seeds(seed)
+
+    # --- Minimal, robust typography for publication-quality figs ---
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    mpl.rcParams.update({
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "figure.figsize": (7.0, 4.2),
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "font.size": 11,
+        "axes.labelsize": 11,
+        "axes.titlesize": 12,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    # --- Load actor into a lightweight agent (no pretraining/state precompute needed) ---
     dummy_cfg = NADPConfig(seed=seed, bc_pretrain_epochs=0, precompute_norm=False)
     agent = NADPAgent(env, dummy_cfg)
     try:
@@ -1003,22 +1041,25 @@ def evaluate_nadp(env: PerishableInventoryEnv, actor_path: str, episodes: int = 
         agent.actor.load_state_dict(ckpt)
     agent.actor.eval()
 
-    total_raw = 0.0
-    per_ep_raw = []
-    total_expired = 0.0
-    total_fulfilled = 0.0
-    
+    # --- Evaluation loop; collect per-episode stats ---
+    per_ep_raw: List[float] = []
+    per_ep_waste: List[float] = []
+    per_ep_len: List[int] = []
+
     for i in range(episodes):
         s = env.reset(start_day=None if start_days is None else start_days[i])
         done = False
         ep_ret_raw = 0.0
         ep_expired = 0.0
         ep_fulfilled = 0.0
+        length = 0
+
         while not done:
             s_n = agent._norm_state(s, update_stats=False)
             st = agent._to_tensor(s_n).unsqueeze(0)
             with torch.no_grad():
                 mean_out, _ = agent.actor(st)
+
             if agent.cfg.use_residual:
                 base = policy_dataset_reorder(env)
                 adaptive_scale = np.maximum(np.abs(base) * 0.5, 10.0)
@@ -1026,26 +1067,157 @@ def evaluate_nadp(env: PerishableInventoryEnv, actor_path: str, episodes: int = 
                 a = base + residual
             else:
                 a = torch.sigmoid(mean_out).squeeze(0).numpy() * env.cfg.max_action
+
             a = np.clip(a, 0.0, env.cfg.max_action)
             s, r, done, info = env.step(a)
-            ep_ret_raw += info.get('raw_reward', r * env.cfg.reward_scale)
-            ep_expired += np.sum(info.get('expired', 0))
-            ep_fulfilled += np.sum(info.get('fulfilled', 0))
+
+            ep_ret_raw += info.get("raw_reward", r * env.cfg.reward_scale)
+            ep_expired += float(np.sum(info.get("expired", 0.0)))
+            ep_fulfilled += float(np.sum(info.get("fulfilled", 0.0)))
+            length += 1
+
         per_ep_raw.append(ep_ret_raw)
-        total_raw += ep_ret_raw
-        total_expired += ep_expired
-        total_fulfilled += ep_fulfilled
-        
-    waste_rate = total_expired / (total_fulfilled + total_expired + 1e-6)
+        wr = ep_expired / (ep_expired + ep_fulfilled + 1e-6)
+        per_ep_waste.append(wr)
+        per_ep_len.append(length)
+
+    per_ep_raw = np.array(per_ep_raw, dtype=np.float64)
+    per_ep_waste = np.array(per_ep_waste, dtype=np.float64)
+
     stats = {
-        "avg_return": float(total_raw / episodes),
-        "std_return": float(np.std(per_ep_raw)),
+        "avg_return": float(np.mean(per_ep_raw)),
+        "std_return": float(np.std(per_ep_raw, ddof=1) if len(per_ep_raw) > 1 else 0.0),
         "min_return": float(np.min(per_ep_raw)),
         "max_return": float(np.max(per_ep_raw)),
-        "waste_rate": float(waste_rate),
+        "waste_rate": float(np.mean(per_ep_waste)),
         "episodes": int(episodes)
     }
-    print(f"NADP eval: avg={stats['avg_return']:.1f}±{stats['std_return']:.1f}, waste_rate={waste_rate:.3f}")
+
+    print(f"NADP eval: avg={stats['avg_return']:.1f}±{stats['std_return']:.1f}, "
+          f"waste_rate={stats['waste_rate']:.3f}")
+
+    # --- Plot helpers ---
+    def _save_all_formats(fig, base):
+        for ext in ("pdf", "svg", "png"):
+            fig.savefig(f"{base}.{ext}", bbox_inches="tight")
+
+    def _rolling_mean_and_ci(y, w=10):
+        y = np.asarray(y, dtype=np.float64)
+        if len(y) < 2:
+            return y, None, None
+        w = max(2, min(w, len(y)))
+        kernel = np.ones(w) / w
+        mean = np.convolve(y, kernel, mode="valid")
+        # rolling std
+        ysq = np.convolve(y**2, kernel, mode="valid")
+        var = np.maximum(ysq - mean**2, 0.0)
+        std = np.sqrt(var)
+        # 95% CI of the mean in each window
+        ci = 1.96 * (std / np.sqrt(w))
+        return mean, mean - ci, mean + ci
+
+    if make_plots and len(per_ep_raw) > 0:
+        x = np.arange(1, len(per_ep_raw) + 1)
+
+        # 1) Line plot with rolling mean + 95% CI
+        fig1, ax1 = plt.subplots(figsize=(7.0, 3.8))
+        ax1.plot(x, per_ep_raw, linewidth=1.0, alpha=0.6, label="Per-episode return")
+        m, lo, hi = _rolling_mean_and_ci(per_ep_raw, w=max(5, len(per_ep_raw)//10))
+        if m is not None:
+            xr = np.arange(len(m)) + 1 + (len(per_ep_raw) - len(m))
+            ax1.plot(xr, m, linewidth=2.0, label="Rolling mean")
+            ax1.fill_between(xr, lo, hi, alpha=0.2, label="95% CI")
+        ax1.set_xlabel("Episode")
+        ax1.set_ylabel("Raw return")
+        ax1.set_title("Evaluation: Per-episode Returns")
+        ax1.legend(loc="best", frameon=False)
+        _save_all_formats(fig1, f"{save_prefix}_returns_line")
+        plt.close(fig1)
+
+        # 2) Histogram + ECDF
+        fig2, ax2 = plt.subplots(figsize=(7.0, 3.8))
+        n, bins, _ = ax2.hist(per_ep_raw, bins=min(30, max(8, int(np.sqrt(len(per_ep_raw))))),
+                              density=True, alpha=0.65)
+        ax2.set_xlabel("Raw return")
+        ax2.set_ylabel("Density")
+        ax2.set_title("Distribution of Returns")
+
+        # ECDF on twin y-axis
+        ax2b = ax2.twinx()
+        sorted_y = np.sort(per_ep_raw)
+        ecdf = np.arange(1, len(sorted_y)+1) / len(sorted_y)
+        ax2b.plot(sorted_y, ecdf, linewidth=1.6)
+        ax2b.set_ylabel("ECDF")
+
+        _save_all_formats(fig2, f"{save_prefix}_returns_hist_ecdf")
+        plt.close(fig2)
+
+        # 3) Scatter: waste vs return + OLS fit + R^2
+        fig3, ax3 = plt.subplots(figsize=(7.0, 3.8))
+        ax3.scatter(per_ep_waste, per_ep_raw, alpha=0.8)
+        ax3.set_xlabel("Waste rate")
+        ax3.set_ylabel("Raw return")
+        ax3.set_title("Returns vs. Waste")
+
+        if len(per_ep_waste) >= 2 and (per_ep_waste.std() > 1e-12):
+            coeffs = np.polyfit(per_ep_waste, per_ep_raw, 1)
+            line_x = np.linspace(per_ep_waste.min(), per_ep_waste.max(), 100)
+            line_y = coeffs[0]*line_x + coeffs[1]
+            ax3.plot(line_x, line_y, linestyle="--", linewidth=1.8, label="OLS fit")
+            # R^2
+            y_hat = coeffs[0]*per_ep_waste + coeffs[1]
+            ss_res = float(np.sum((per_ep_raw - y_hat)**2))
+            ss_tot = float(np.sum((per_ep_raw - np.mean(per_ep_raw))**2))
+            r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+            ax3.text(0.02, 0.98, f"$R^2$ = {r2:.3f}", transform=ax3.transAxes,
+                     ha="left", va="top")
+            ax3.legend(loc="best", frameon=False)
+
+        _save_all_formats(fig3, f"{save_prefix}_returns_vs_waste")
+        plt.close(fig3)
+
+        # 4) Violin + box overlay
+        fig4, ax4 = plt.subplots(figsize=(4.0, 4.0))
+        parts = ax4.violinplot(dataset=[per_ep_raw], showmeans=False, showextrema=False, showmedians=False)
+        # overlay box-style summary
+        q1, med, q3 = np.percentile(per_ep_raw, [25, 50, 75])
+        iqr = q3 - q1
+        whisk_low = np.min(per_ep_raw[per_ep_raw >= q1 - 1.5*iqr]) if iqr > 0 else np.min(per_ep_raw)
+        whisk_high = np.max(per_ep_raw[per_ep_raw <= q3 + 1.5*iqr]) if iqr > 0 else np.max(per_ep_raw)
+        ax4.hlines([q1, med, q3], 0.8, 1.2, linewidth=[1.5, 2.2, 1.5])
+        ax4.vlines(1.0, whisk_low, whisk_high, linewidth=1.2)
+        ax4.set_xticks([1]); ax4.set_xticklabels(["Returns"])
+        ax4.set_ylabel("Raw return")
+        ax4.set_title("Return Distribution (Violin + Box)")
+        _save_all_formats(fig4, f"{save_prefix}_violin_box")
+        plt.close(fig4)
+
+        # 5) Multipanel summary
+        fig5, axs = plt.subplots(2, 2, figsize=(7.0, 6.0))
+        # 5a line
+        axs[0,0].plot(x, per_ep_raw, linewidth=1.0, alpha=0.6)
+        if m is not None:
+            axs[0,0].plot(xr, m, linewidth=2.0)
+            axs[0,0].fill_between(xr, lo, hi, alpha=0.2)
+        axs[0,0].set_title("Per-episode Returns"); axs[0,0].set_xlabel("Episode"); axs[0,0].set_ylabel("Raw return")
+        # 5b hist
+        axs[0,1].hist(per_ep_raw, bins=min(30, max(8, int(np.sqrt(len(per_ep_raw))))), density=True, alpha=0.8)
+        axs[0,1].set_title("Return Distribution"); axs[0,1].set_xlabel("Raw return"); axs[0,1].set_ylabel("Density")
+        # 5c scatter
+        axs[1,0].scatter(per_ep_waste, per_ep_raw, alpha=0.8)
+        axs[1,0].set_title("Returns vs Waste"); axs[1,0].set_xlabel("Waste rate"); axs[1,0].set_ylabel("Raw return")
+        if len(per_ep_waste) >= 2 and (per_ep_waste.std() > 1e-12):
+            axs[1,0].plot(line_x, line_y, linestyle="--", linewidth=1.6)
+        # 5d violin (minimal)
+        axs[1,1].violinplot([per_ep_raw], showmeans=False, showextrema=False, showmedians=False)
+        axs[1,1].hlines([q1, med, q3], 0.8, 1.2, linewidth=[1.3, 1.8, 1.3])
+        axs[1,1].vlines(1.0, whisk_low, whisk_high, linewidth=1.0)
+        axs[1,1].set_xticks([1]); axs[1,1].set_xticklabels(["Returns"])
+        axs[1,1].set_ylabel("Raw return")
+        plt.tight_layout()
+        _save_all_formats(fig5, f"{save_prefix}_multipanel")
+        plt.close(fig5)
+
     return stats
 
 
